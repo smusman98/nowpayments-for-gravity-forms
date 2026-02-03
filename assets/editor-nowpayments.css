@@ -1,0 +1,17 @@
+/**
+ * Form editor: hide sidebar field icon (NOWPayments logo in Field Settings).
+ */
+#sidebar_field_icon { 
+	display: none !important;
+}
+
+.addon-logo.dashicons img {
+    width: 100% !important;
+    height: 100% !important;
+}
+
+span.gform-form-toolbar__icon img {
+    width: 100%;
+    height: 100%;
+}
+
