@@ -26,7 +26,7 @@ class GF_Field_NowPayments extends GF_Field {
 	public $type = 'nowpayments';
 
 	/**
-	 * Indicates the field is used for payment (like Square field).
+	 * Indicates the field is used for payment.
 	 *
 	 * @var bool
 	 */

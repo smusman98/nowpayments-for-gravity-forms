@@ -28,6 +28,20 @@ define( 'NOWPAYMENTS_GF_BASENAME', plugin_basename( __FILE__ ) );
 define( 'NOWPAYMENTS_GF_FILE', __FILE__ );
 
 /**
+ * Debug logger for this plugin (only logs when WP_DEBUG is true).
+ *
+ * @param string $message Message to log.
+ * @return void
+ */
+function nowpayments_gf_debug_log( $message ) {
+	if ( ! ( defined( 'WP_DEBUG' ) && WP_DEBUG ) ) {
+		return;
+	}
+	// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- debug-only logging.
+	error_log( $message );
+}
+
+/**
  * Check if Gravity Forms is active.
  *
  * @return bool
@@ -63,7 +77,7 @@ function nowpayments_gf_load_textdomain() {
 }
 
 /**
- * Ensure NOWPayments capabilities exist and are assigned to Administrator (like Square).
+ * Ensure NOWPayments capabilities exist and are assigned to Administrator.
  */
 function nowpayments_gf_ensure_capabilities() {
 	$role = get_role( 'administrator' );
@@ -100,6 +114,15 @@ function nowpayments_gf_init() {
 	require_once NOWPAYMENTS_GF_DIR . 'includes/class-nowpayments-gf-api.php';
 	require_once NOWPAYMENTS_GF_DIR . 'includes/class-nowpayments-gf-simple-payment.php';
 	require_once NOWPAYMENTS_GF_DIR . 'includes/class-nowpayments-gf-addon.php';
+	// Load subscription handler if present; allows Pro features via a single file.
+	$subscription_file    = apply_filters( 'nowpayments_gf_subscription_file', NOWPAYMENTS_GF_DIR . 'includes/class-nowpayments-gf-subscription.php' );
+	$enable_subscriptions = apply_filters( 'nowpayments_gf_enable_subscriptions', file_exists( $subscription_file ) );
+	if ( $enable_subscriptions && file_exists( $subscription_file ) ) {
+		require_once $subscription_file;
+		if ( class_exists( 'NowPayments_GF_Subscription' ) && method_exists( 'NowPayments_GF_Subscription', 'register_hooks' ) ) {
+			NowPayments_GF_Subscription::register_hooks();
+		}
+	}
 
 	GFAddOn::register( 'NowPayments_GF_AddOn' );
 

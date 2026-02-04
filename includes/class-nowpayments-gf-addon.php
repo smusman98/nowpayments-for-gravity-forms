@@ -108,11 +108,11 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 						'default_value' => 'sandbox',
 					),
 					array(
-						'name'  => 'live_api_key',
-						'label' => __( 'Live API Key', 'nowpayments-for-gravity-forms' ),
-						'type'  => 'text',
+						'name'       => 'live_api_key',
+						'label'      => __( 'Live API Key', 'nowpayments-for-gravity-forms' ),
+						'type'       => 'text',
 						'input_type' => 'password',
-						'class' => 'large',
+						'class'      => 'large',
 					),
 					array(
 						'name'  => 'live_ipn_secret',
@@ -121,11 +121,11 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 						'class' => 'large',
 					),
 					array(
-						'name'  => 'sandbox_api_key',
-						'label' => __( 'Sandbox API Key', 'nowpayments-for-gravity-forms' ),
-						'type'  => 'text',
+						'name'       => 'sandbox_api_key',
+						'label'      => __( 'Sandbox API Key', 'nowpayments-for-gravity-forms' ),
+						'type'       => 'text',
 						'input_type' => 'password',
-						'class' => 'large',
+						'class'      => 'large',
 					),
 					array(
 						'name'  => 'sandbox_ipn_secret',
@@ -151,6 +151,8 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 				),
 			),
 		);
+
+		$fields = apply_filters( 'nowpayments_gf_plugin_settings_fields', $fields, $this );
 
 		return $fields;
 	}
@@ -209,10 +211,26 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 	 */
 	public function redirect_url( $feed, $submission_data, $form, $entry ) {
 		$transaction_type = rgar( $feed, 'meta/transactionType', 'product' );
+		nowpayments_gf_debug_log( '[NOWPayments-GF-DEBUG] redirect_url: transaction_type=' . $transaction_type . ' form_id=' . ( isset( $form['id'] ) ? $form['id'] : '' ) );
 		if ( 'subscription' === $transaction_type ) {
-			if ( class_exists( 'NowPayments_GF_Subscription' ) && method_exists( 'NowPayments_GF_Subscription', 'get_redirect_url' ) ) {
-				return NowPayments_GF_Subscription::get_redirect_url( $feed, $submission_data, $form, $entry, $this->get_api() );
+			$api = $this->get_api();
+			if ( ! $api ) {
+				nowpayments_gf_debug_log( '[NOWPayments-GF-DEBUG] redirect_url: subscription but get_api() null -> error=api_config' );
+				return add_query_arg( 'error', 'api_config', home_url( '/' ) );
 			}
+
+			$url = apply_filters( 'nowpayments_gf_subscription_redirect_url', '', $feed, $submission_data, $form, $entry, $api, $this );
+			if ( $url ) {
+				nowpayments_gf_debug_log( '[NOWPayments-GF-DEBUG] redirect_url: subscription URL from filter: ' . $url );
+				return $url;
+			}
+
+			if ( class_exists( 'NowPayments_GF_Subscription' ) && method_exists( 'NowPayments_GF_Subscription', 'get_redirect_url' ) ) {
+				$url = NowPayments_GF_Subscription::get_redirect_url( $feed, $submission_data, $form, $entry, $api, $this );
+				nowpayments_gf_debug_log( '[NOWPayments-GF-DEBUG] redirect_url: subscription get_redirect_url returned: ' . ( is_string( $url ) ? $url : wp_json_encode( $url ) ) );
+				return $url;
+			}
+			nowpayments_gf_debug_log( '[NOWPayments-GF-DEBUG] redirect_url: subscription class/method not found -> error=subscription_not_supported' );
 			return add_query_arg( 'error', 'subscription_not_supported', $this->get_cancel_url( $form ) );
 		}
 
@@ -226,7 +244,7 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 			return add_query_arg( 'error', 'payment_create', home_url( '/' ) );
 		}
 
-		// Add a pending note so the entry has a record immediately (Square-like notes).
+		// Add a pending note so the entry has a record immediately.
 		$amount           = rgar( $submission_data, 'payment_amount', 0 );
 		$currency         = NowPayments_GF_Simple_Payment::get_currency( $feed );
 		$amount_formatted = $amount ? GFCommon::to_money( $amount, $entry['currency'] ) : ( $currency ? $currency : '' );
@@ -266,6 +284,58 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 	}
 
 	/**
+	 * Create a subscription during validation (GF payment add-on flow).
+	 *
+	 * @param array $feed Active payment feed.
+	 * @param array $submission_data Submission data.
+	 * @param array $form Form object.
+	 * @param array $entry Entry object (not saved yet).
+	 * @return array
+	 */
+	public function subscribe( $feed, $submission_data, $form, $entry ) {
+		nowpayments_gf_debug_log( '[NOWPayments-GF-DEBUG] subscribe() called. form_id=' . ( isset( $form['id'] ) ? $form['id'] : '' ) . ' payment_amount=' . rgar( $submission_data, 'payment_amount', 0 ) );
+		$result = apply_filters( 'nowpayments_gf_subscription_request', null, $feed, $submission_data, $form, $entry, $this );
+		if ( is_array( $result ) ) {
+			nowpayments_gf_debug_log( '[NOWPayments-GF-DEBUG] subscribe() returning from filter: ' . wp_json_encode( $result ) );
+			return $result;
+		}
+
+		if ( class_exists( 'NowPayments_GF_Subscription' ) && method_exists( 'NowPayments_GF_Subscription', 'subscribe' ) ) {
+			$result = NowPayments_GF_Subscription::subscribe( null, $feed, $submission_data, $form, $entry, $this );
+			nowpayments_gf_debug_log( '[NOWPayments-GF-DEBUG] subscribe() Subscription::subscribe result: ' . wp_json_encode( $result ) );
+			return $result;
+		}
+
+		nowpayments_gf_debug_log( '[NOWPayments-GF-DEBUG] subscribe() subscriptions not enabled' );
+		return array(
+			'is_success'    => false,
+			'error_message' => __( 'Subscriptions are not enabled for NOWPayments.', 'nowpayments-for-gravity-forms' ),
+		);
+	}
+
+	/**
+	 * For off-site subscription we must set redirect_url here; GF only calls redirect_url() for one-time payments.
+	 * confirmation() uses $this->redirect_url to send the user to NOWPayments.
+	 *
+	 * @param array $authorization   Authorization from subscribe().
+	 * @param array $feed            Active payment feed.
+	 * @param array $submission_data Submission data.
+	 * @param array $form            Form object.
+	 * @param array $entry           Entry object.
+	 * @return array Entry.
+	 */
+	public function process_subscription( $authorization, $feed, $submission_data, $form, $entry ) {
+		if ( ! empty( $authorization['subscription']['is_success'] ) ) {
+			$api = $this->get_api();
+			if ( $api ) {
+				$this->redirect_url = $this->redirect_url( $feed, $submission_data, $form, $entry );
+				nowpayments_gf_debug_log( '[NOWPayments-GF-DEBUG] process_subscription set redirect_url: ' . ( $this->redirect_url ? $this->redirect_url : '(empty)' ) );
+			}
+		}
+		return parent::process_subscription( $authorization, $feed, $submission_data, $form, $entry );
+	}
+
+	/**
 	 * Get API instance based on plugin settings.
 	 *
 	 * @return NowPayments_GF_API|null
@@ -292,6 +362,33 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 	protected function get_cancel_url( $form ) {
 		$referer = isset( $_SERVER['HTTP_REFERER'] ) ? esc_url_raw( wp_unslash( $_SERVER['HTTP_REFERER'] ) ) : '';
 		return $referer ? $referer : home_url( '/' );
+	}
+
+	/**
+	 * Show payment/subscription error on the NOWPayments field (GF default looks for creditcard only).
+	 *
+	 * @param array $validation_result    Contains the form validation results.
+	 * @param array $authorization_result Contains the form authorization results.
+	 * @return array
+	 */
+	public function get_validation_result( $validation_result, $authorization_result ) {
+		$credit_card_page = 0;
+		$error_message    = rgar( $authorization_result, 'error_message', '' );
+		if ( empty( $error_message ) ) {
+			$error_message = __( 'There was a problem with your payment. Please try again.', 'nowpayments-for-gravity-forms' );
+		}
+		foreach ( $validation_result['form']['fields'] as &$field ) {
+			if ( 'nowpayments' === $field->type ) {
+				$field->failed_validation  = true;
+				$field->validation_message = $error_message;
+				// phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- Gravity Forms core property name.
+				$credit_card_page = (int) $field->pageNumber;
+				break;
+			}
+		}
+		$validation_result['credit_card_page'] = $credit_card_page;
+		$validation_result['is_valid']         = false;
+		return $validation_result;
 	}
 
 	/**
@@ -338,6 +435,13 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 		if ( ! $this->is_payment_gateway( $entry['id'] ) ) {
 			status_header( 400 );
 			echo 'Not a NOWPayments entry';
+			exit;
+		}
+
+		$subscription_handled = apply_filters( 'nowpayments_gf_handle_subscription_webhook', false, $data, $entry, $this );
+		if ( $subscription_handled ) {
+			status_header( 200 );
+			echo 'OK';
 			exit;
 		}
 
