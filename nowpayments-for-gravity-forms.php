@@ -27,44 +27,6 @@ define( 'NOWPAYMENTS_GF_URL', plugin_dir_url( __FILE__ ) );
 define( 'NOWPAYMENTS_GF_BASENAME', plugin_basename( __FILE__ ) );
 define( 'NOWPAYMENTS_GF_FILE', __FILE__ );
 
-if ( ! function_exists( 'nfgf_fs' ) ) :
-    /**
-     * Integrate Freemius sdk.
-     *
-     * @since 1.0.0
-     * @return Freemius
-     */
-    function nfgf_fs() {
-        global $nfgf_fs;
-
-        if ( is_null( $nfgf_fs ) ) {
-            require_once dirname( __FILE__ ) . '/vendor/freemius/start.php';
-
-            $nfgf_fs = fs_dynamic_init(
-                array(
-                        'id'               => '24631',
-                        'slug'             => 'nowpayments-for-gravity-forms',
-                        'type'             => 'plugin',
-                        'public_key'       => 'pk_de3aa90312cf1f93471c8e6178f58',
-                        'is_premium'       => false,
-                        'has_addons'       => true,
-                        'has_paid_plans'   => false,
-                        'is_org_compliant' => true,
-                        'menu'             => array(
-                            'account' => false,
-                            'support' => false,
-                        ),
-                )
-            );
-        }
-
-        return $nfgf_fs;
-    }
-
-    nfgf_fs();
-    do_action( 'nfgf_fs_loaded' );
-endif;
-
 /**
  * Debug logger for this plugin (only logs when WP_DEBUG is true).
  *
