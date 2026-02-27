@@ -66,17 +66,6 @@ function nowpayments_gf_missing_notice() {
 }
 
 /**
- * Load plugin text domain (init or later per WordPress 6.7+).
- */
-function nowpayments_gf_load_textdomain() {
-	load_plugin_textdomain(
-		'nowpayments-for-gravity-forms',
-		false,
-		dirname( NOWPAYMENTS_GF_BASENAME ) . '/languages'
-	);
-}
-
-/**
  * Ensure NOWPayments capabilities exist and are assigned to Administrator.
  */
 function nowpayments_gf_ensure_capabilities() {
@@ -138,8 +127,6 @@ add_action( 'plugins_loaded', 'nowpayments_gf_ensure_capabilities', 0 );
 // Register addon when GF fires gform_loaded (before GF runs init_addons() in the same loaded() call).
 add_action( 'gform_loaded', 'nowpayments_gf_init', 5 );
 
-// Load text domain at init so translation functions are not triggered too early (WP 6.7+).
-add_action( 'init', 'nowpayments_gf_load_textdomain', 5 );
 /**
  * Enqueue Gravity Forms admin CSS.
  *
