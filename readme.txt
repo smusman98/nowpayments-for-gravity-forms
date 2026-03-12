@@ -22,6 +22,15 @@ NOWPayments for Gravity Forms adds NOWPayments as a payment option in Gravity Fo
 * Webhook (IPN) handling with HMAC verification
 * Redirect to NOWPayments checkout
 
+== External services ==
+
+This plugin uses the NOWPayments API to process cryptocurrency payments. NOWPayments is a crypto payment gateway that allows you to accept 300+ cryptocurrencies.
+
+*   This plugin sends transaction data (amount, currency, order ID) to NOWPayments when a user initiates a checkout.
+*   The checkout process happens on the NOWPayments hosted payment page (https://nowpayments.io).
+*   The plugin receives payment status updates via NOWPayments IPN (Instant Payment Notification).
+*   Service provided by: **NOWPayments Ltd.** ([Terms of Service](https://nowpayments.io/terms-of-service), [Privacy Policy](https://nowpayments.io/privacy-policy))
+
 == Installation ==
 
 1. Install and activate Gravity Forms.
