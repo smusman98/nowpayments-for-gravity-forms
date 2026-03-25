@@ -97,7 +97,7 @@ class NowPayments_GF_Simple_Payment {
 	 * @return string
 	 */
 	public static function get_webhook_url() {
-		return add_query_arg( 'action', 'nowpayments_gf_webhook', admin_url( 'admin-ajax.php' ) );
+		return NowPayments_GF_AddOn::get_instance()->get_ipn_webhook_url();
 	}
 
 	/**

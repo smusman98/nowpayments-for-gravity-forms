@@ -1,7 +1,6 @@
 <?php
 /**
  * Plugin Name: NOWPayments for Gravity Forms
- * Plugin URI: https://www.coderpress.co/
  * Author: CoderPress
  * Description: Accept 300+ cryptocurrencies via NOWPayments on Gravity Forms. Simple payment and sandbox mode.
  * Version: 1.0.0

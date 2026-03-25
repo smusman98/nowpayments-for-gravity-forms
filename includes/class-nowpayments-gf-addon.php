@@ -146,7 +146,7 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 						'type'          => 'text',
 						'description'   => __( 'Use this URL in your NOWPayments store IPN settings.', 'nowpayments-for-gravity-forms' ),
 						'readonly'      => true,
-						'default_value' => add_query_arg( 'action', 'nowpayments_gf_webhook', admin_url( 'admin-ajax.php' ) ),
+						'default_value' => $this->get_ipn_webhook_url(),
 					),
 				),
 			),
@@ -365,6 +365,82 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 	}
 
 	/**
+	 * Bootstrap hooks after add-on init.
+	 *
+	 * @return void
+	 */
+	public function init() {
+		parent::init();
+		add_action( 'rest_api_init', array( $this, 'register_ipn_rest_route' ) );
+	}
+
+	/**
+	 * Public webhook URL (REST API) for NOWPayments IPN.
+	 *
+	 * @return string
+	 */
+	public function get_ipn_webhook_url() {
+		return rest_url( 'nowpayments-gf/v1/ipn' );
+	}
+
+	/**
+	 * Register IPN route. Authorization is IPN HMAC (see process handler), not a logged-in nonce.
+	 *
+	 * @return void
+	 */
+	public function register_ipn_rest_route() {
+		register_rest_route(
+			'nowpayments-gf/v1',
+			'/ipn',
+			array(
+				'methods'             => WP_REST_Server::CREATABLE,
+				'callback'            => array( $this, 'handle_ipn_rest_request' ),
+				'permission_callback' => array( $this, 'ipn_rest_permission_check' ),
+			)
+		);
+	}
+
+	/**
+	 * IPN is server-to-server; capability checks are not applicable. Access is gated by verify_ipn_signature().
+	 *
+	 * @param WP_REST_Request $request Request (unused; required by REST API).
+	 * @return true
+	 */
+	public function ipn_rest_permission_check( $request ) {
+		unset( $request );
+		return true;
+	}
+
+	/**
+	 * REST handler for NOWPayments IPN webhook.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response|WP_Error
+	 */
+	public function handle_ipn_rest_request( $request ) {
+		if ( ! $request instanceof WP_REST_Request ) {
+			return new WP_Error(
+				'nowpayments_ipn_error',
+				'Invalid request',
+				array( 'status' => 400 )
+			);
+		}
+
+		$raw    = $request->get_body();
+		$result = $this->process_nowpayments_ipn( $raw );
+
+		if ( $result['http_status'] >= 400 ) {
+			return new WP_Error(
+				'nowpayments_ipn_failed',
+				$result['body'],
+				array( 'status' => $result['http_status'] )
+			);
+		}
+
+		return new WP_REST_Response( $result['body'], $result['http_status'] );
+	}
+
+	/**
 	 * Show payment/subscription error on the NOWPayments field (GF default looks for creditcard only).
 	 *
 	 * @param array $validation_result    Contains the form validation results.
@@ -392,63 +468,105 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 	}
 
 	/**
-	 * Handle IPN callback (webhook).
+	 * Gravity Forms payment framework callback (?callback=slug). IPN is handled via REST only.
 	 *
-	 * @return void
+	 * @return array|false Always false; do not process gateway IPN here.
 	 */
 	public function callback() {
-		$raw  = file_get_contents( 'php://input' );
+		return false;
+	}
+
+	/**
+	 * Process NOWPayments IPN body (JSON). Authorization: IPN secret + X-NOWPayments-Sig HMAC on raw payload.
+	 *
+	 * @param string $raw Raw request body (JSON).
+	 * @return array{http_status:int,body:string}
+	 */
+	protected function process_nowpayments_ipn( $raw ) {
+		if ( ! is_string( $raw ) ) {
+			$raw = '';
+		}
+
+		$max_len = (int) apply_filters( 'nowpayments_gf_ipn_max_body_length', 1048576 );
+		if ( $max_len > 0 && strlen( $raw ) > $max_len ) {
+			return array(
+				'http_status' => 413,
+				'body'        => 'Payload too large',
+			);
+		}
+
 		$data = json_decode( $raw, true );
-		if ( json_last_error() !== JSON_ERROR_NONE || empty( $data ) ) {
-			status_header( 400 );
-			echo 'Invalid JSON';
-			exit;
+		if ( json_last_error() !== JSON_ERROR_NONE || ! is_array( $data ) || empty( $data ) ) {
+			return array(
+				'http_status' => 400,
+				'body'        => 'Invalid JSON',
+			);
 		}
 
 		$settings   = $this->get_plugin_settings();
 		$is_live    = rgar( $settings, 'gateway_environment' ) !== 'sandbox';
 		$ipn_secret = $is_live ? rgar( $settings, 'live_ipn_secret' ) : rgar( $settings, 'sandbox_ipn_secret' );
-		if ( ! empty( $ipn_secret ) && ! $this->verify_ipn_signature( $raw, $data, $ipn_secret ) ) {
-			status_header( 401 );
-			echo 'Invalid signature';
-			exit;
+		$ipn_secret = is_string( $ipn_secret ) ? trim( $ipn_secret ) : '';
+
+		if ( '' === $ipn_secret ) {
+			return array(
+				'http_status' => 401,
+				'body'        => 'IPN secret not configured',
+			);
 		}
 
-		$payment_status = isset( $data['payment_status'] ) ? strtoupper( $data['payment_status'] ) : '';
-		$order_id       = isset( $data['order_id'] ) ? $data['order_id'] : 0;
+		if ( ! $this->verify_ipn_signature( $raw, $data, $ipn_secret ) ) {
+			return array(
+				'http_status' => 401,
+				'body'        => 'Invalid signature',
+			);
+		}
 
-		// Resolve entry from order_id (we send entry id or a temporary id).
-		$entry_id = is_numeric( $order_id ) ? (int) $order_id : 0;
+		$payment_status = isset( $data['payment_status'] ) ? strtoupper( sanitize_text_field( (string) $data['payment_status'] ) ) : '';
+		$order_raw      = isset( $data['order_id'] ) ? sanitize_text_field( (string) $data['order_id'] ) : '';
+		$entry_id       = is_numeric( $order_raw ) ? absint( $order_raw ) : 0;
+
 		if ( $entry_id <= 0 ) {
-			status_header( 400 );
-			echo 'Missing order_id';
-			exit;
+			return array(
+				'http_status' => 400,
+				'body'        => 'Missing order_id',
+			);
 		}
 
 		$entry = GFAPI::get_entry( $entry_id );
 		if ( is_wp_error( $entry ) || empty( $entry ) ) {
-			status_header( 404 );
-			echo 'Entry not found';
-			exit;
+			return array(
+				'http_status' => 404,
+				'body'        => 'Entry not found',
+			);
 		}
 
 		if ( ! $this->is_payment_gateway( $entry['id'] ) ) {
-			status_header( 400 );
-			echo 'Not a NOWPayments entry';
-			exit;
+			return array(
+				'http_status' => 400,
+				'body'        => 'Not a NOWPayments entry',
+			);
 		}
 
 		$subscription_handled = apply_filters( 'nowpayments_gf_handle_subscription_webhook', false, $data, $entry, $this );
 		if ( $subscription_handled ) {
-			status_header( 200 );
-			echo 'OK';
-			exit;
+			return array(
+				'http_status' => 200,
+				'body'        => 'OK',
+			);
 		}
 
+		$pay_currency = isset( $data['pay_currency'] ) ? sanitize_text_field( (string) $data['pay_currency'] ) : '';
+		$payment_id   = isset( $data['payment_id'] ) ? sanitize_text_field( (string) $data['payment_id'] ) : '';
+		$payment_id   = substr( $payment_id, 0, 191 );
+
+		$actually_paid = isset( $data['actually_paid'] ) ? floatval( $data['actually_paid'] ) : 0.0;
+		$price_amount  = isset( $data['price_amount'] ) ? sanitize_text_field( (string) $data['price_amount'] ) : '';
+
 		$result = array(
-			'id'               => isset( $data['payment_id'] ) ? $data['payment_id'] : '',
-			'transaction_id'   => isset( $data['payment_id'] ) ? $data['payment_id'] : '',
-			'amount'           => isset( $data['actually_paid'] ) ? (float) $data['actually_paid'] : 0,
+			'id'               => $payment_id,
+			'transaction_id'   => $payment_id,
+			'amount'           => $actually_paid,
 			'entry_id'         => $entry['id'],
 			'payment_status'   => 'Paid',
 			'payment_date'     => gmdate( 'Y-m-d H:i:s' ),
@@ -456,12 +574,14 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 			'transaction_type' => 'payment',
 		);
 
-		$currency         = isset( $data['pay_currency'] ) ? sanitize_text_field( $data['pay_currency'] ) : '';
 		$amount_formatted = $result['amount'] > 0
 			? GFCommon::to_money( $result['amount'], $entry['currency'] )
-			: ( isset( $data['price_amount'] ) && $currency ? $data['price_amount'] . ' ' . $currency : '' );
-		$payment_id       = isset( $data['payment_id'] ) ? $data['payment_id'] : '';
-		$status_label     = $payment_status ? $payment_status : 'UNKNOWN';
+			: ( $price_amount && $pay_currency ? $price_amount . ' ' . $pay_currency : '' );
+		$amount_formatted = $amount_formatted ? wp_strip_all_tags( (string) $amount_formatted ) : '';
+
+		$status_label = $payment_status ? $payment_status : 'UNKNOWN';
+		$status_label = sanitize_text_field( $status_label );
+		$payment_id_note = $payment_id ? $payment_id : __( 'N/A', 'nowpayments-for-gravity-forms' );
 
 		switch ( $payment_status ) {
 			case 'CONFIRMED':
@@ -470,16 +590,24 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 					/* translators: 1: amount 2: transaction id 3: status */
 					__( 'Payment completed. Amount: %1$s. Transaction Id: %2$s. Status: %3$s.', 'nowpayments-for-gravity-forms' ),
 					$amount_formatted ? $amount_formatted : __( 'N/A', 'nowpayments-for-gravity-forms' ),
-					$payment_id ? $payment_id : __( 'N/A', 'nowpayments-for-gravity-forms' ),
+					$payment_id_note,
 					$status_label
 				);
 				$this->complete_payment( $entry, $result );
 				break;
 			case 'FAILED':
 			case 'EXPIRED':
-				$result['type']  = 'fail_payment';
-				$result['note']  = isset( $data['message'] ) ? $data['message'] : __( 'Payment failed or expired.', 'nowpayments-for-gravity-forms' );
-				$result['note'] .= $payment_id ? sprintf( ' Transaction Id: %s.', $payment_id ) : '';
+				$fail_msg = __( 'Payment failed or expired.', 'nowpayments-for-gravity-forms' );
+				if ( isset( $data['message'] ) && is_string( $data['message'] ) ) {
+					$fail_msg = sanitize_textarea_field( $data['message'] );
+				}
+				$result['type'] = 'fail_payment';
+				$result['note']  = $fail_msg;
+				$result['note'] .= $payment_id ? ' ' . sprintf(
+					/* translators: %s: transaction id */
+					__( 'Transaction Id: %s.', 'nowpayments-for-gravity-forms' ),
+					$payment_id
+				) : '';
 				$this->fail_payment( $entry, $result );
 				break;
 			case 'REFUNDED':
@@ -488,15 +616,16 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 					/* translators: 1: amount 2: transaction id */
 					__( 'Payment refunded. Amount: %1$s. Transaction Id: %2$s.', 'nowpayments-for-gravity-forms' ),
 					$amount_formatted ? $amount_formatted : __( 'N/A', 'nowpayments-for-gravity-forms' ),
-					$payment_id ? $payment_id : __( 'N/A', 'nowpayments-for-gravity-forms' )
+					$payment_id_note
 				);
 				$this->refund_payment( $entry, $result );
 				break;
 		}
 
-		status_header( 200 );
-		echo 'OK';
-		exit;
+		return array(
+			'http_status' => 200,
+			'body'        => 'OK',
+		);
 	}
 
 	/**
@@ -534,19 +663,7 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 		return $data;
 	}
 
-	/**
-	 * Register AJAX handler for webhook (no-priv and priv).
-	 */
 	public function init_ajax() {
 		parent::init_ajax();
-		add_action( 'wp_ajax_nopriv_nowpayments_gf_webhook', array( $this, 'handle_webhook_ajax' ) );
-		add_action( 'wp_ajax_nowpayments_gf_webhook', array( $this, 'handle_webhook_ajax' ) );
-	}
-
-	/**
-	 * Handle webhook via admin-ajax (callback URL).
-	 */
-	public function handle_webhook_ajax() {
-		$this->callback();
 	}
 }
