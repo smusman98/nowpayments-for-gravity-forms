@@ -248,7 +248,7 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 		$amount           = rgar( $submission_data, 'payment_amount', 0 );
 		$currency         = NowPayments_GF_Simple_Payment::get_currency( $feed );
 		$amount_formatted = $amount ? GFCommon::to_money( $amount, $entry['currency'] ) : ( $currency ? $currency : '' );
-		$order_id         = rgar( $entry, 'id' ) ? $entry['id'] : '';
+		$order_id         = rgar( $entry, 'id' ) ? (string) $entry['id'] : '';
 		$note             = sprintf(
 			/* translators: 1: amount 2: order id */
 			__( 'Payment initiated. Amount: %1$s. Order Id: %2$s. Status: Pending.', 'nowpayments-for-gravity-forms' ),
@@ -345,12 +345,33 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 		if ( empty( $settings ) ) {
 			return null;
 		}
+
 		$is_live = rgar( $settings, 'gateway_environment' ) !== 'sandbox';
-		$key     = $is_live ? rgar( $settings, 'live_api_key' ) : rgar( $settings, 'sandbox_api_key' );
-		if ( empty( $key ) ) {
+
+		$key = $is_live ? rgar( $settings, 'live_api_key' ) : rgar( $settings, 'sandbox_api_key' );
+		if ( rgblank( $key ) ) {
+			$key = $this->get_plugin_setting( $is_live ? 'live_api_key' : 'sandbox_api_key' );
+		}
+		$key = is_string( $key ) ? trim( $key ) : '';
+		if ( '' === $key ) {
 			return null;
 		}
-		return new NowPayments_GF_API( $is_live, $key );
+
+		/**
+		 * Filter NOWPayments API credentials.
+		 *
+		 * @param array $credentials Keys: api_key, is_live.
+		 */
+		$credentials = apply_filters(
+			'nowpayments_gf_api_credentials',
+			array(
+				'api_key' => $key,
+				'is_live' => $is_live,
+			),
+			$this
+		);
+
+		return new NowPayments_GF_API( $credentials['is_live'], $credentials['api_key'] );
 	}
 
 	/**
@@ -372,6 +393,7 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 	public function init() {
 		parent::init();
 		add_action( 'rest_api_init', array( $this, 'register_ipn_rest_route' ) );
+		add_action( 'template_redirect', array( $this, 'maybe_sync_payment_on_return' ), 5 );
 	}
 
 	/**
@@ -516,15 +538,16 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 		}
 
 		if ( ! $this->verify_ipn_signature( $raw, $data, $ipn_secret ) ) {
+			nowpayments_gf_debug_log( '[NOWPayments-GF] IPN rejected: invalid signature for entry order_id=' . ( isset( $data['order_id'] ) ? $data['order_id'] : '' ) );
 			return array(
 				'http_status' => 401,
 				'body'        => 'Invalid signature',
 			);
 		}
 
-		$payment_status = isset( $data['payment_status'] ) ? strtoupper( sanitize_text_field( (string) $data['payment_status'] ) ) : '';
-		$order_raw      = isset( $data['order_id'] ) ? sanitize_text_field( (string) $data['order_id'] ) : '';
-		$entry_id       = is_numeric( $order_raw ) ? absint( $order_raw ) : 0;
+		nowpayments_gf_debug_log( '[NOWPayments-GF] IPN received: payment_status=' . ( isset( $data['payment_status'] ) ? $data['payment_status'] : '' ) . ' order_id=' . ( isset( $data['order_id'] ) ? $data['order_id'] : '' ) . ' payment_id=' . ( isset( $data['payment_id'] ) ? $data['payment_id'] : '' ) );
+
+		$entry_id = $this->resolve_ipn_entry_id( $data );
 
 		if ( $entry_id <= 0 ) {
 			return array(
@@ -541,11 +564,15 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 			);
 		}
 
-		if ( ! $this->is_payment_gateway( $entry['id'] ) ) {
+		if ( ! $this->is_payment_gateway( $entry['id'] ) && ! $this->entry_uses_nowpayments( $entry ) ) {
 			return array(
 				'http_status' => 400,
 				'body'        => 'Not a NOWPayments entry',
 			);
+		}
+
+		if ( ! $this->is_payment_gateway( $entry['id'] ) ) {
+			gform_update_meta( $entry['id'], 'payment_gateway', $this->get_slug() );
 		}
 
 		$subscription_handled = apply_filters( 'nowpayments_gf_handle_subscription_webhook', false, $data, $entry, $this );
@@ -556,16 +583,147 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 			);
 		}
 
+		$this->apply_ipn_payment_update( $entry, $data );
+
+		return array(
+			'http_status' => 200,
+			'body'        => 'OK',
+		);
+	}
+
+	/**
+	 * Resolve Gravity Forms entry ID from IPN payload.
+	 *
+	 * @param array $data IPN payload.
+	 * @return int
+	 */
+	protected function resolve_ipn_entry_id( $data ) {
+		$order_keys = array( 'order_id', 'orderID' );
+
+		foreach ( $order_keys as $key ) {
+			if ( ! isset( $data[ $key ] ) || $data[ $key ] === null || $data[ $key ] === '' ) {
+				continue;
+			}
+
+			$raw = sanitize_text_field( (string) $data[ $key ] );
+			if ( is_numeric( $raw ) ) {
+				return absint( $raw );
+			}
+
+			$entry_id = $this->find_entry_id_by_nowpayments_order_id( $raw );
+			if ( $entry_id > 0 ) {
+				return $entry_id;
+			}
+		}
+
+		return 0;
+	}
+
+	/**
+	 * Find entry by stored NOWPayments order id meta.
+	 *
+	 * @param string $order_id Order id from gateway.
+	 * @return int
+	 */
+	protected function find_entry_id_by_nowpayments_order_id( $order_id ) {
+		global $wpdb;
+
+		if ( '' === $order_id ) {
+			return 0;
+		}
+
+		$table = GFFormsModel::get_entry_meta_table_name();
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$entry_id = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT entry_id FROM %i WHERE meta_key = %s AND meta_value = %s LIMIT 1",
+				$table,
+				'nowpayments_order_id',
+				$order_id
+			)
+		);
+
+		return $entry_id ? absint( $entry_id ) : 0;
+	}
+
+	/**
+	 * Whether the entry's form uses a NOWPayments field.
+	 *
+	 * @param array $entry Entry.
+	 * @return bool
+	 */
+	protected function entry_uses_nowpayments( $entry ) {
+		$form_id = absint( rgar( $entry, 'form_id' ) );
+		if ( $form_id <= 0 ) {
+			return false;
+		}
+
+		$form = GFAPI::get_form( $form_id );
+		if ( empty( $form['fields'] ) ) {
+			return false;
+		}
+
+		foreach ( $form['fields'] as $field ) {
+			if ( is_object( $field ) && isset( $field->type ) && 'nowpayments' === $field->type ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Normalize payment status from IPN payload.
+	 *
+	 * @param array $data IPN payload.
+	 * @return string Uppercase status or empty string.
+	 */
+	protected function get_ipn_payment_status( $data ) {
+		$status = '';
+
+		if ( isset( $data['payment_status'] ) && $data['payment_status'] !== null && $data['payment_status'] !== '' ) {
+			$status = (string) $data['payment_status'];
+		} elseif ( isset( $data['status'] ) && $data['status'] !== null && $data['status'] !== '' ) {
+			$status = (string) $data['status'];
+		}
+
+		return $status ? strtoupper( sanitize_text_field( $status ) ) : '';
+	}
+
+	/**
+	 * Apply IPN status to a Gravity Forms entry.
+	 *
+	 * @param array $entry Entry (updated in place when marked paid).
+	 * @param array $data  IPN or API payment payload.
+	 * @return void
+	 */
+	protected function apply_ipn_payment_update( &$entry, $data ) {
+		$payment_status = $this->get_ipn_payment_status( $data );
+
 		$pay_currency = isset( $data['pay_currency'] ) ? sanitize_text_field( (string) $data['pay_currency'] ) : '';
 		$payment_id   = isset( $data['payment_id'] ) ? sanitize_text_field( (string) $data['payment_id'] ) : '';
 		$payment_id   = substr( $payment_id, 0, 191 );
 
+		if ( $payment_id && rgar( $entry, 'id' ) ) {
+			$form_id = absint( rgar( $entry, 'form_id' ) );
+			if ( $form_id > 0 ) {
+				gform_update_meta( $entry['id'], 'nowpayments_payment_id', $payment_id, $form_id );
+			}
+		}
+
 		$actually_paid = isset( $data['actually_paid'] ) ? floatval( $data['actually_paid'] ) : 0.0;
-		$price_amount  = isset( $data['price_amount'] ) ? sanitize_text_field( (string) $data['price_amount'] ) : '';
+		if ( $actually_paid <= 0 && isset( $data['actually_paid_amount'] ) ) {
+			$actually_paid = floatval( $data['actually_paid_amount'] );
+		}
+		if ( $actually_paid <= 0 && isset( $data['price_amount'] ) ) {
+			$actually_paid = floatval( $data['price_amount'] );
+		}
+
+		$price_amount = isset( $data['price_amount'] ) ? sanitize_text_field( (string) $data['price_amount'] ) : '';
 
 		$result = array(
 			'id'               => $payment_id,
-			'transaction_id'   => $payment_id,
+			'transaction_id'   => $payment_id ? $payment_id : rgar( $entry, 'transaction_id' ),
 			'amount'           => $actually_paid,
 			'entry_id'         => $entry['id'],
 			'payment_status'   => 'Paid',
@@ -579,22 +737,32 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 			: ( $price_amount && $pay_currency ? $price_amount . ' ' . $pay_currency : '' );
 		$amount_formatted = $amount_formatted ? wp_strip_all_tags( (string) $amount_formatted ) : '';
 
-		$status_label = $payment_status ? $payment_status : 'UNKNOWN';
-		$status_label = sanitize_text_field( $status_label );
+		$status_label    = $payment_status ? $payment_status : 'UNKNOWN';
 		$payment_id_note = $payment_id ? $payment_id : __( 'N/A', 'nowpayments-for-gravity-forms' );
 
+		$completed_statuses = array( 'CONFIRMED', 'COMPLETED', 'FINISHED' );
+		$completed_statuses = apply_filters( 'nowpayments_gf_completed_payment_statuses', $completed_statuses, $data, $entry, $this );
+
+		if ( in_array( $payment_status, $completed_statuses, true ) ) {
+			if ( 'Paid' === rgar( $entry, 'payment_status' ) ) {
+				$this->sync_nowpayments_entry_meta( $entry, $data, 'Paid' );
+				return;
+			}
+
+			$result['note'] = sprintf(
+				/* translators: 1: amount 2: transaction id 3: status */
+				__( 'Payment completed. Amount: %1$s. Transaction Id: %2$s. Status: %3$s.', 'nowpayments-for-gravity-forms' ),
+				$amount_formatted ? $amount_formatted : __( 'N/A', 'nowpayments-for-gravity-forms' ),
+				$payment_id_note,
+				$status_label
+			);
+			$this->complete_payment( $entry, $result );
+			$this->sync_nowpayments_entry_meta( $entry, $data, 'Paid' );
+			nowpayments_gf_debug_log( '[NOWPayments-GF] Entry ' . $entry['id'] . ' marked Paid (status=' . $payment_status . ').' );
+			return;
+		}
+
 		switch ( $payment_status ) {
-			case 'CONFIRMED':
-			case 'COMPLETED':
-				$result['note'] = sprintf(
-					/* translators: 1: amount 2: transaction id 3: status */
-					__( 'Payment completed. Amount: %1$s. Transaction Id: %2$s. Status: %3$s.', 'nowpayments-for-gravity-forms' ),
-					$amount_formatted ? $amount_formatted : __( 'N/A', 'nowpayments-for-gravity-forms' ),
-					$payment_id_note,
-					$status_label
-				);
-				$this->complete_payment( $entry, $result );
-				break;
 			case 'FAILED':
 			case 'EXPIRED':
 				$fail_msg = __( 'Payment failed or expired.', 'nowpayments-for-gravity-forms' );
@@ -609,6 +777,7 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 					$payment_id
 				) : '';
 				$this->fail_payment( $entry, $result );
+				$this->sync_nowpayments_entry_meta( $entry, $data, 'Failed' );
 				break;
 			case 'REFUNDED':
 				$result['type'] = 'refund_payment';
@@ -619,13 +788,233 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 					$payment_id_note
 				);
 				$this->refund_payment( $entry, $result );
+				$this->sync_nowpayments_entry_meta( $entry, $data, 'Refunded' );
+				break;
+			default:
+				if ( $payment_status ) {
+					$this->sync_nowpayments_entry_meta( $entry, $data, $status_label );
+				}
 				break;
 		}
+	}
 
-		return array(
-			'http_status' => 200,
-			'body'        => 'OK',
+	/**
+	 * Keep NOWPayments entry meta in sync with Gravity Forms payment status.
+	 *
+	 * @param array  $entry     Entry.
+	 * @param array  $data      Payment payload.
+	 * @param string $gf_status Display status for meta.
+	 * @return void
+	 */
+	protected function sync_nowpayments_entry_meta( $entry, $data, $gf_status ) {
+		$entry_id = absint( rgar( $entry, 'id' ) );
+		$form_id  = absint( rgar( $entry, 'form_id' ) );
+		if ( $entry_id <= 0 || $form_id <= 0 ) {
+			return;
+		}
+
+		gform_update_meta( $entry_id, 'nowpayments_payment_status', $gf_status, $form_id );
+
+		if ( isset( $data['payment_id'] ) && $data['payment_id'] !== '' && $data['payment_id'] !== null ) {
+			gform_update_meta( $entry_id, 'nowpayments_payment_id', sanitize_text_field( (string) $data['payment_id'] ), $form_id );
+		}
+
+		$paid = isset( $data['actually_paid'] ) ? floatval( $data['actually_paid'] ) : 0.0;
+		if ( $paid <= 0 && isset( $data['actually_paid_amount'] ) ) {
+			$paid = floatval( $data['actually_paid_amount'] );
+		}
+		if ( $paid > 0 ) {
+			gform_update_meta( $entry_id, 'nowpayments_amount', $paid, $form_id );
+		}
+
+		if ( ! empty( $data['pay_currency'] ) ) {
+			gform_update_meta( $entry_id, 'nowpayments_pay_currency', sanitize_text_field( (string) $data['pay_currency'] ), $form_id );
+		}
+
+		gform_update_meta( $entry_id, 'nowpayments_payment_date', gmdate( 'Y-m-d H:i:s' ), $form_id );
+	}
+
+	/**
+	 * After customer returns from NOWPayments, sync payment status via API when IPN is delayed.
+	 *
+	 * @return void
+	 */
+	public function maybe_sync_payment_on_return() {
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Public return URL; entry id validated below.
+		if ( empty( $_GET['nowpayments_gf_return'] ) || empty( $_GET['entry_id'] ) ) {
+			return;
+		}
+
+		$entry_id = absint( wp_unslash( $_GET['entry_id'] ) );
+		if ( $entry_id <= 0 ) {
+			return;
+		}
+
+		$entry = GFAPI::get_entry( $entry_id );
+		if ( is_wp_error( $entry ) || empty( $entry ) ) {
+			return;
+		}
+
+		if ( ! $this->is_payment_gateway( $entry['id'] ) && ! $this->entry_uses_nowpayments( $entry ) ) {
+			return;
+		}
+
+		$current_status = rgar( $entry, 'payment_status' );
+		if ( in_array( $current_status, array( 'Paid', 'Active' ), true ) ) {
+			return;
+		}
+
+		// NOWPayments may append payment_status to the success redirect URL.
+		$return_payload = $this->get_return_url_payment_payload();
+		if ( ! empty( $return_payload ) ) {
+			$this->apply_ipn_payment_update( $entry, $return_payload );
+			$entry = GFAPI::get_entry( $entry_id );
+			if ( ! is_wp_error( $entry ) && 'Paid' === rgar( $entry, 'payment_status' ) ) {
+				return;
+			}
+		}
+
+		$api = $this->get_api();
+		if ( ! $api ) {
+			nowpayments_gf_debug_log( '[NOWPayments-GF] Return sync skipped: API key not configured.' );
+			return;
+		}
+
+		$payment_id = $this->get_return_payment_id( $entry );
+		if ( $payment_id > 0 ) {
+			$payment = $api->get_payment( $payment_id );
+			if ( ! is_wp_error( $payment ) && is_array( $payment ) ) {
+				$this->apply_ipn_payment_update( $entry, $payment );
+				$entry = GFAPI::get_entry( $entry_id );
+				if ( ! is_wp_error( $entry ) && 'Paid' === rgar( $entry, 'payment_status' ) ) {
+					return;
+				}
+			} else {
+				nowpayments_gf_debug_log( '[NOWPayments-GF] Return sync get_payment error: ' . ( is_wp_error( $payment ) ? $payment->get_error_message() : 'invalid response' ) );
+			}
+		}
+
+		$response = $api->list_payments(
+			array(
+				'order_id' => (string) $entry_id,
+				'limit'    => 20,
+				'sortBy'   => 'created_at',
+				'orderBy'  => 'desc',
+			)
 		);
+
+		if ( is_wp_error( $response ) ) {
+			nowpayments_gf_debug_log( '[NOWPayments-GF] Return sync API error: ' . $response->get_error_message() );
+			return;
+		}
+
+		$payments = $this->normalize_payments_list( $response );
+
+		$completed_statuses = apply_filters(
+			'nowpayments_gf_completed_payment_statuses',
+			array( 'finished', 'confirmed', 'completed' ),
+			array(),
+			$entry,
+			$this
+		);
+
+		foreach ( $payments as $payment ) {
+			if ( ! is_array( $payment ) ) {
+				continue;
+			}
+
+			$status = isset( $payment['payment_status'] ) ? strtolower( (string) $payment['payment_status'] ) : '';
+			if ( ! in_array( $status, array_map( 'strtolower', $completed_statuses ), true ) ) {
+				continue;
+			}
+
+			$this->apply_ipn_payment_update( $entry, $payment );
+			break;
+		}
+	}
+
+	/**
+	 * Build payment payload from query string on NOWPayments success redirect.
+	 *
+	 * @return array
+	 */
+	protected function get_return_url_payment_payload() {
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Public return URL from payment provider.
+		$status = '';
+		foreach ( array( 'payment_status', 'status', 'NP_status' ) as $key ) {
+			if ( ! empty( $_GET[ $key ] ) ) {
+				$status = sanitize_text_field( wp_unslash( $_GET[ $key ] ) );
+				break;
+			}
+		}
+
+		if ( '' === $status ) {
+			return array();
+		}
+
+		$payload = array( 'payment_status' => $status );
+
+		foreach ( array( 'payment_id', 'paymentId', 'NP_id', 'iid' ) as $key ) {
+			if ( ! empty( $_GET[ $key ] ) ) {
+				$payload['payment_id'] = absint( wp_unslash( $_GET[ $key ] ) );
+				break;
+			}
+		}
+
+		foreach ( array( 'actually_paid', 'pay_amount', 'price_amount' ) as $key ) {
+			if ( isset( $_GET[ $key ] ) && $_GET[ $key ] !== '' ) {
+				$payload[ $key ] = sanitize_text_field( wp_unslash( $_GET[ $key ] ) );
+			}
+		}
+
+		if ( ! empty( $_GET['pay_currency'] ) ) {
+			$payload['pay_currency'] = sanitize_text_field( wp_unslash( $_GET['pay_currency'] ) );
+		}
+
+		return $payload;
+	}
+
+	/**
+	 * Resolve NOWPayments payment ID from return URL or entry meta.
+	 *
+	 * @param array $entry Entry.
+	 * @return int
+	 */
+	protected function get_return_payment_id( $entry ) {
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Public return URL from payment provider.
+		foreach ( array( 'payment_id', 'paymentId', 'NP_id', 'iid' ) as $key ) {
+			if ( ! empty( $_GET[ $key ] ) ) {
+				$id = absint( wp_unslash( $_GET[ $key ] ) );
+				if ( $id > 0 ) {
+					return $id;
+				}
+			}
+		}
+
+		$stored = gform_get_meta( $entry['id'], 'nowpayments_payment_id' );
+		return $stored ? absint( $stored ) : 0;
+	}
+
+	/**
+	 * Normalize list payments API response to an array of payments.
+	 *
+	 * @param array $response API response.
+	 * @return array
+	 */
+	protected function normalize_payments_list( $response ) {
+		if ( isset( $response['data'] ) && is_array( $response['data'] ) ) {
+			return $response['data'];
+		}
+		if ( isset( $response['payments'] ) && is_array( $response['payments'] ) ) {
+			return $response['payments'];
+		}
+		if ( isset( $response['result'] ) && is_array( $response['result'] ) ) {
+			return $response['result'];
+		}
+		if ( array_values( $response ) === $response ) {
+			return $response;
+		}
+		return array();
 	}
 
 	/**
@@ -640,10 +1029,26 @@ class NowPayments_GF_AddOn extends GFPaymentAddOn {
 		if ( empty( $_SERVER['HTTP_X_NOWPAYMENTS_SIG'] ) ) {
 			return false;
 		}
-		$received   = sanitize_text_field( wp_unslash( $_SERVER['HTTP_X_NOWPAYMENTS_SIG'] ) );
+
+		$received = sanitize_text_field( wp_unslash( $_SERVER['HTTP_X_NOWPAYMENTS_SIG'] ) );
+		$secret   = trim( $ipn_secret );
+
+		// Official NOWPayments PHP example: recursive key sort + json_encode( JSON_UNESCAPED_SLASHES ).
 		$sorted     = $this->sort_array_recursive( $data );
-		$calculated = hash_hmac( 'sha512', wp_json_encode( $sorted, JSON_UNESCAPED_SLASHES ), trim( $ipn_secret ) );
-		return hash_equals( $calculated, $received );
+		$payload    = json_encode( $sorted, JSON_UNESCAPED_SLASHES );
+		$calculated = hash_hmac( 'sha512', $payload, $secret );
+
+		if ( hash_equals( $calculated, $received ) ) {
+			return true;
+		}
+
+		// Legacy top-level sort only (older integrations).
+		$legacy = $data;
+		ksort( $legacy );
+		$legacy_payload = json_encode( $legacy, JSON_UNESCAPED_SLASHES );
+		$legacy_hmac    = hash_hmac( 'sha512', $legacy_payload, $secret );
+
+		return hash_equals( $legacy_hmac, $received );
 	}
 
 	/**

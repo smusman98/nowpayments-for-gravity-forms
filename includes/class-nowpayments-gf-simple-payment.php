@@ -38,7 +38,7 @@ class NowPayments_GF_Simple_Payment {
 			$product_name = sprintf( __( 'Form #%d', 'nowpayments-for-gravity-forms' ), (int) $form['id'] );
 		}
 
-		$order_id = rgar( $entry, 'id' ) ? $entry['id'] : ( 'gf_nowpayments_' . uniqid( '', true ) );
+		$order_id = rgar( $entry, 'id' ) ? (string) $entry['id'] : ( 'gf_nowpayments_' . uniqid( '', true ) );
 
 		$parameters = array(
 			'dataSource'      => 'gravity-forms',
