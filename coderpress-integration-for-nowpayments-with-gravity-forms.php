@@ -1,6 +1,6 @@
 <?php
 /**
- * Plugin Name: NOWPayments for Gravity Forms
+ * Plugin Name: CoderPress Integration for NOWPayments with Gravity Forms
  * Author: CoderPress
  * Description: Accept 300+ cryptocurrencies via NOWPayments on Gravity Forms. Simple payment and sandbox mode.
  * Version: 1.0.0
@@ -58,7 +58,7 @@ function nowpayments_gf_check_gravity_forms() {
 function nowpayments_gf_missing_notice() {
 	?>
 	<div class="notice notice-error">
-		<p><?php esc_html_e( 'NOWPayments for Gravity Forms requires Gravity Forms to be installed and active.', 'nowpayments-for-gravity-forms' ); ?></p>
+		<p><?php esc_html_e( 'CoderPress Integration for NOWPayments with Gravity Forms requires Gravity Forms to be installed and active.', 'nowpayments-for-gravity-forms' ); ?></p>
 	</div>
 	<?php
 }
